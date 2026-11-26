@@ -8,7 +8,8 @@ const TOOLS = [
   {
     name: 'list_transcripts',
     description:
-      'Listet Janoschs Diktate aus der Diktier-App, neueste zuerst: id, Datum, Länge in Sekunden und Textanfang.',
+      'Listet Janoschs Aufnahmen aus der Diktier-App (Diktate, Kundengespräche, Meetings), neueste zuerst: id, Datum, Länge in Sekunden und Textanfang. ' +
+      'Dient als Quelle für Infos, mit denen er danach weiterarbeitet.',
     inputSchema: {
       type: 'object',
       properties: { limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Anzahl, Standard 20' } },
