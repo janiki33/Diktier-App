@@ -1,32 +1,30 @@
-// Diktat: Aufnahme in Stücken, sofort in IndexedDB, Upload-Warteschlange, Verlauf.
-const SEG_MS = 30_000;
-const MIN_SEG_S = 0.4;
+// Diktat: Spracherkennung von iOS-Safari (de-CH), Text laufend in IndexedDB, Verlauf, Kopie auf dem Server für Claude.
 const $ = (id) => document.getElementById(id);
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 
 // ---------- IndexedDB ----------
 const db = await new Promise((resolve, reject) => {
-  const r = indexedDB.open('diktat', 1);
+  const r = indexedDB.open('diktat', 2);
   r.onupgradeneeded = () => {
-    r.result.createObjectStore('sessions', { keyPath: 'id' });
-    r.result.createObjectStore('segments', { keyPath: 'key' }).createIndex('session', 'sessionId');
+    const d = r.result;
+    if (!d.objectStoreNames.contains('sessions')) d.createObjectStore('sessions', { keyPath: 'id' });
+    if (d.objectStoreNames.contains('segments')) d.deleteObjectStore('segments');
   };
   r.onsuccess = () => resolve(r.result);
   r.onerror = () => reject(r.error);
 });
-function idb(store, mode, fn) {
+function idb(mode, fn) {
   return new Promise((resolve, reject) => {
-    const t = db.transaction(store, mode);
-    const req = fn(t.objectStore(store));
+    const t = db.transaction('sessions', mode);
+    const req = fn(t.objectStore('sessions'));
     t.oncomplete = () => resolve(req?.result);
     t.onerror = () => reject(t.error);
   });
 }
-const put = (store, v) => idb(store, 'readwrite', (s) => s.put(v));
-const del = (store, k) => idb(store, 'readwrite', (s) => s.delete(k));
-const all = (store) => idb(store, 'readonly', (s) => s.getAll());
-const segmentsOf = (id) =>
-  idb('segments', 'readonly', (s) => s.index('session').getAll(id)).then((l) => l.sort((a, b) => a.index - b.index));
+const put = (v) => idb('readwrite', (s) => s.put(v));
+const del = (k) => idb('readwrite', (s) => s.delete(k));
+const all = () => idb('readonly', (s) => s.getAll());
 
 // ---------- Helfer ----------
 const newId = () => Date.now().toString(36).padStart(9, '0') + Math.random().toString(36).slice(2, 8);
@@ -39,152 +37,139 @@ const dateCH = (ms) => {
   const d = new Date(ms);
   return `${d.toLocaleDateString('de-CH')}, ${String(d.getHours()).padStart(2, '0')}.${String(d.getMinutes()).padStart(2, '0')}`;
 };
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const swiss = (t) => t.replace(/ß/g, 'ss').replace(/\s+/g, ' ').trim();
+const join = (a, b) => swiss(`${a} ${b}`);
 const token = () => localStorage.getItem('token') || '';
-function setStatus(text = '') { $('status').textContent = text; }
+const setStatus = (text = '') => { $('status').textContent = text; };
 function haptic() {
   // iOS 18+: Ein Schalter-Input löst beim Umschalten über das Label eine Vibration aus.
   document.querySelector('.haptic').click();
   navigator.vibrate?.(8);
 }
-const MIME = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'].find((t) => window.MediaRecorder?.isTypeSupported?.(t)) || '';
 
 // ---------- Aufnahme ----------
-let rec = null; // laufende Aufnahme
-let shownSession = null; // Diktat, dessen Text gerade sichtbar ist
-
-async function getMic() {
-  return navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
-}
+let rec = null; // laufendes Diktat
 
 async function startRecording() {
-  if (!token()) return openSettings();
-  let stream;
-  try {
-    stream = await getMic();
-  } catch {
-    return setStatus('Mikrofon nicht erlaubt. In den Einstellungen freigeben.');
-  }
-  const session = { id: newId(), createdAt: Date.now(), duration: 0, state: 'recording', text: '', synced: false };
-  await put('sessions', session);
-  rec = { session, stream: null, mr: null, index: 0, elapsed: 0, segStart: 0, active: true, interrupted: false, gap: 0 };
-  showSession(session.id, true);
-  attachStream(stream);
-  startSegment();
+  const session = { id: newId(), createdAt: Date.now(), duration: 0, text: '', state: 'recording', synced: false };
+  await put(session);
+  rec = { session, active: true, t0: performance.now(), before: '', current: '', recog: null, restarts: 0 };
+  resetView('Ich höre zu.');
   document.body.classList.add('recording');
   $('rec').setAttribute('aria-pressed', 'true');
   $('rec').setAttribute('aria-label', 'Aufnahme stoppen');
   setStatus('');
+  if (SR) listen();
+  else keyboardMode();
   keepAwake();
   tick();
 }
 
-function attachStream(stream) {
-  rec.stream = stream;
-  const track = stream.getAudioTracks()[0];
-  // iOS beendet oder stummt das Mikrofon, wenn die App in den Hintergrund geht.
-  track.onended = track.onmute = () => interrupt();
-  meter.connect(stream);
+function listen() {
+  const r = new SR();
+  r.lang = 'de-CH';
+  r.continuous = true;
+  r.interimResults = true;
+  r.onaudiostart = () => meter.start();
+  r.onresult = (e) => {
+    if (rec?.recog !== r) return;
+    // Jedes Mal die ganze Liste lesen: Safari meldet resultIndex und isFinal nicht immer sauber.
+    let finals = '', interim = '';
+    for (const res of e.results) (res.isFinal ? (finals += ` ${res[0].transcript}`) : (interim += ` ${res[0].transcript}`));
+    rec.current = swiss(finals);
+    rec.restarts = 0;
+    meter.bump();
+    render(join(rec.before, rec.current), swiss(interim));
+    save();
+  };
+  r.onerror = (e) => {
+    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+      setStatus('Spracherkennung nicht erlaubt. In den Einstellungen Mikrofon und Spracherkennung für Safari freigeben.');
+      rec && (rec.active = false);
+    } else if (e.error === 'audio-capture' && meter.live) {
+      meter.giveUpMic(); // iOS teilt das Mikrofon manchmal nicht mit der Pegelanzeige
+    }
+  };
+  r.onend = () => {
+    if (rec?.recog !== r) return;
+    // iOS beendet die Erkennung nach Pausen oder etwa einer Minute: Text sichern und neu starten.
+    rec.before = join(rec.before, rec.current);
+    rec.current = '';
+    render(rec.before, '');
+    if (rec.active && rec.restarts++ < 20) setTimeout(() => rec?.active && rec.recog === r && listen(), 120);
+    else if (rec.active) interrupted();
+    else finishRecording();
+  };
+  rec.recog = r;
+  try { r.start(); } catch { interrupted(); }
 }
 
-function startSegment() {
-  const r = rec;
-  const mr = new MediaRecorder(r.stream, MIME ? { mimeType: MIME } : undefined);
-  const seg = {
-    key: `${r.session.id}:${String(r.index).padStart(5, '0')}`,
-    sessionId: r.session.id, index: r.index++, type: mr.mimeType || MIME || 'audio/mp4',
-    duration: 0, gapBefore: r.gap, status: 'recording', text: null, blob: null,
-  };
-  r.gap = 0;
-  const chunks = [];
-  const started = performance.now();
-  r.segStart = started;
-  const save = () => {
-    seg.blob = new Blob(chunks, { type: seg.type });
-    seg.duration = (performance.now() - started) / 1000;
-    return put('segments', seg);
-  };
-  // Jede Sekunde sichern: Wird die App beendet, bleibt höchstens 1 s verloren.
-  mr.ondataavailable = (e) => { if (e.data.size) { chunks.push(e.data); save(); } };
-  mr.onstop = async () => {
-    clearTimeout(timer);
-    r.elapsed += (performance.now() - started) / 1000;
-    r.segStart = 0;
-    await save();
-    seg.status = seg.duration < MIN_SEG_S || !seg.blob.size ? 'done' : 'pending';
-    if (seg.status === 'done') seg.text = '';
-    await put('segments', seg);
-    pump();
-    if (r.active && !r.interrupted) startSegment();
-    else if (!r.active) finishRecording();
-  };
-  mr.start(1000);
-  r.mr = mr;
-  const timer = setTimeout(() => mr.state === 'recording' && mr.stop(), SEG_MS);
+// Wenn iOS die Erkennung nicht mehr startet (Hintergrund, gesperrt), beim Zurückkehren weiter.
+function interrupted() {
+  if (!rec?.active) return;
+  rec.waiting = true;
+  setStatus('iOS hat die Spracherkennung angehalten. Sie läuft weiter, sobald die App wieder offen ist.');
 }
 
 function stopRecording() {
   if (!rec) return;
   rec.active = false;
-  if (rec.mr?.state === 'recording') rec.mr.stop();
-  else finishRecording();
+  if (rec.keyboard) return finishRecording();
+  try { rec.recog?.stop(); } catch { /* schon beendet */ }
+  // Falls onend nicht kommt
+  setTimeout(() => rec && !rec.active && finishRecording(), 1500);
 }
 
 async function finishRecording() {
   const r = rec;
   if (!r || r.done) return;
   r.done = true;
-  r.stream?.getTracks().forEach((t) => t.stop());
-  meter.disconnect();
-  releaseAwake();
-  r.session.duration = r.elapsed;
-  r.session.state = 'ended';
-  await put('sessions', r.session);
   rec = null;
-  document.body.classList.remove('recording');
+  if (r.keyboard) r.before = swiss($('kbd').value);
+  r.session.text = join(r.before, r.current);
+  r.session.duration = (performance.now() - r.t0) / 1000;
+  r.session.state = 'final';
+  await put(r.session);
+  meter.stop();
+  releaseAwake();
+  document.body.classList.remove('recording', 'keyboard');
+  setStatus('');
+  $('kbd').blur();
   $('rec').setAttribute('aria-pressed', 'false');
   $('rec').setAttribute('aria-label', 'Aufnahme starten');
-  $('timer').textContent = clock(r.elapsed);
-  pump();
+  $('timer').textContent = clock(r.session.duration);
+  render(r.session.text, '');
+  if (!r.session.text) resetView('Kein Text erkannt.');
+  sync();
 }
 
-function interrupt() {
-  if (!rec?.active || rec.interrupted) return;
-  rec.interrupted = true;
-  rec.interruptedAt = Date.now();
-  setStatus('iOS hat das Mikrofon angehalten. Es läuft weiter, sobald die App wieder offen ist.');
-  if (rec.mr?.state === 'recording') rec.mr.stop();
+// Zwischenstand bei jedem Ergebnis sichern, damit beim Wegwischen nichts verloren geht.
+function save() {
+  if (!rec) return;
+  rec.session.text = join(rec.before, rec.current);
+  rec.session.duration = (performance.now() - rec.t0) / 1000;
+  put(rec.session);
 }
-
-async function resume() {
-  if (!rec?.active || !rec.interrupted || rec.resuming) return;
-  rec.resuming = true;
-  try {
-    const old = rec.stream?.getAudioTracks()[0];
-    const stream = old && old.readyState === 'live' && !old.muted ? rec.stream : await getMic();
-    if (stream !== rec.stream) { rec.stream?.getTracks().forEach((t) => t.stop()); attachStream(stream); }
-    rec.gap = (Date.now() - rec.interruptedAt) / 1000;
-    rec.interrupted = false;
-    setStatus('');
-    startSegment();
-    keepAwake();
-  } catch {
-    setStatus('Mikrofon nicht mehr verfügbar. Aufnahme beendet.');
-    rec.active = false;
-    finishRecording();
-  } finally {
-    if (rec) rec.resuming = false;
-  }
-}
+addEventListener('pagehide', save);
 
 function tick() {
   if (!rec) return;
-  const live = rec.segStart ? (performance.now() - rec.segStart) / 1000 : 0;
-  $('timer').textContent = clock(rec.elapsed + live);
+  $('timer').textContent = clock((performance.now() - rec.t0) / 1000);
   setTimeout(tick, 250);
 }
 
-// Bildschirm wach halten, damit iOS nicht sperrt und das Mikrofon nicht abstellt.
+// Ohne Spracherkennung (z. B. als Homescreen-App, falls iOS sie dort sperrt): Diktieren über die Tastatur.
+function keyboardMode() {
+  rec.keyboard = true;
+  document.body.classList.add('keyboard');
+  const kbd = $('kbd');
+  kbd.value = '';
+  kbd.oninput = () => { rec && (rec.before = swiss(kbd.value)); save(); };
+  kbd.focus();
+  setStatus('Auf der Tastatur das Mikrofon tippen. Fertig: grossen Knopf drücken.');
+}
+
+// Bildschirm wach halten, damit iOS nicht sperrt und die Erkennung nicht abbricht.
 let wakeLock = null;
 async function keepAwake() {
   try { wakeLock = await navigator.wakeLock?.request('screen'); } catch { /* nicht verfügbar */ }
@@ -192,117 +177,63 @@ async function keepAwake() {
 function releaseAwake() { wakeLock?.release().catch(() => {}); wakeLock = null; }
 
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') {
-    resume();
-    if (rec?.active && !wakeLock) keepAwake();
-    pump();
-  }
+  if (document.visibilityState !== 'visible') return;
+  if (rec?.active && !wakeLock) keepAwake();
+  if (rec?.active && rec.waiting) { rec.waiting = false; rec.restarts = 0; setStatus(''); listen(); }
+  sync();
 });
-addEventListener('online', () => pump());
+addEventListener('online', () => sync());
 
-// ---------- Upload-Warteschlange ----------
-let pumping = false;
-let retryTimer = null;
-let backoff = 2000;
-
-async function transcribe(seg) {
-  const r = await fetch('/api/transcribe', {
-    method: 'POST',
-    headers: { authorization: `Bearer ${token()}`, 'content-type': seg.type },
-    body: seg.blob,
-  });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw Object.assign(new Error(data.error || `Fehler ${r.status}`), { status: r.status });
-  return data.text || '';
-}
-
-async function pump() {
-  if (pumping) return;
-  pumping = true;
-  clearTimeout(retryTimer);
-  try {
-    const pending = (await all('segments')).filter((s) => s.status === 'pending').sort((a, b) => (a.key < b.key ? -1 : 1));
-    for (const seg of pending) {
-      try {
-        seg.text = await transcribe(seg);
-        seg.status = 'done';
-        await put('segments', seg);
-        backoff = 2000;
-        if (seg.sessionId === shownSession) appendText(seg);
-      } catch (e) {
-        if (e.status === 401) { setStatus('Zugangscode fehlt oder ist falsch.'); return; }
-        if (e.status === 400 || e.status === 413) { seg.status = 'done'; seg.text = ''; await put('segments', seg); continue; }
-        setStatus(navigator.onLine ? 'Übertragung klappt gerade nicht. Neuer Versuch folgt.' : 'Offline. Die Aufnahme ist gesichert und wird später übertragen.');
-        retryTimer = setTimeout(pump, backoff);
-        backoff = Math.min(backoff * 2, 60_000);
-        return;
-      }
-    }
-    if (!rec?.interrupted) setStatus('');
-    await finalize();
-  } finally {
-    pumping = false;
-  }
-}
-
-async function finalize() {
-  for (const s of await all('sessions')) {
-    if (s.state === 'ended') {
-      const segs = await segmentsOf(s.id);
-      if (segs.some((g) => g.status !== 'done')) continue;
-      s.text = segs.map((g) => g.text).filter(Boolean).join(' ');
-      s.state = 'final';
-      await put('sessions', s);
-      await Promise.all(segs.map((g) => del('segments', g.key)));
-      if (s.id === shownSession && !s.text) { $('placeholder').hidden = false; $('placeholder').textContent = 'Kein Text erkannt.'; }
-    }
-    if (s.state === 'final' && !s.synced && s.text) {
-      const r = await fetch('/api/transcripts', {
-        method: 'POST',
-        headers: { authorization: `Bearer ${token()}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ id: s.id, createdAt: s.createdAt, duration: s.duration, text: s.text }),
-      }).catch(() => null);
-      if (r?.ok) { s.synced = true; await put('sessions', s); }
-    }
+// ---------- Kopie auf dem Server (für Claude) ----------
+async function sync() {
+  if (!token()) return;
+  for (const s of await all()) {
+    if (s.state !== 'final' || s.synced || !s.text) continue;
+    const r = await fetch('/api/transcripts', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token()}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ id: s.id, createdAt: s.createdAt, duration: s.duration, text: s.text }),
+    }).catch(() => null);
+    if (r?.status === 401) return setStatus('Zugangscode für die Ablage ist falsch.');
+    if (r?.ok) { s.synced = true; await put(s); }
   }
   renderHistory();
 }
 
 // ---------- Text ----------
 let shownText = '';
-async function showSession(id, fresh) {
-  shownSession = id;
+let shownWords = [];
+function resetView(placeholder) {
   shownText = '';
-  const box = $('transcript');
-  box.querySelectorAll('.seg, .gap').forEach((n) => n.remove());
-  $('placeholder').hidden = !fresh;
-  $('placeholder').textContent = fresh ? 'Ich höre zu.' : '';
+  shownWords = [];
+  $('words').replaceChildren();
+  $('interim').textContent = '';
+  $('placeholder').hidden = !placeholder;
+  $('placeholder').textContent = placeholder || '';
   $('actions').hidden = true;
 }
 
-function appendText(seg) {
-  const box = $('transcript');
-  if (seg.gapBefore >= 2) {
-    const g = document.createElement('span');
-    g.className = 'gap';
-    g.textContent = `${clock(seg.gapBefore)} nicht aufgenommen`;
-    box.append(g);
-  }
-  if (!seg.text) return;
-  $('placeholder').hidden = true;
-  const p = document.createElement('span');
-  p.className = 'seg';
-  seg.text.split(/\s+/).forEach((word, i) => {
+function render(text, interim) {
+  if (rec?.keyboard) return;
+  const words = text ? text.split(' ') : [];
+  const box = $('words');
+  const prefixOk = shownWords.every((w, i) => words[i] === w);
+  if (!prefixOk) { box.replaceChildren(); shownWords = []; }
+  // Nur neue Wörter einblenden, eins nach dem anderen
+  words.slice(shownWords.length).forEach((word, i) => {
     const w = document.createElement('span');
-    w.className = 'w';
+    w.className = prefixOk ? 'w' : '';
     w.textContent = word;
-    w.style.animationDelay = `${Math.min(i * 40, 2400)}ms`;
-    p.append(w, ' ');
+    w.style.animationDelay = `${Math.min(i * 45, 1200)}ms`;
+    box.append(w, ' ');
   });
-  box.append(p);
-  shownText = shownText ? `${shownText} ${seg.text}` : seg.text;
-  $('actions').hidden = false;
-  box.scrollTo({ top: box.scrollHeight, behavior: reduceMotion.matches ? 'auto' : 'smooth' });
+  shownWords = words;
+  shownText = text;
+  $('interim').textContent = interim;
+  $('placeholder').hidden = Boolean(text || interim);
+  $('actions').hidden = !text;
+  const t = $('transcript');
+  t.scrollTo({ top: t.scrollHeight, behavior: reduceMotion.matches ? 'auto' : 'smooth' });
 }
 
 async function copyText(text) {
@@ -312,13 +243,13 @@ async function shareText(text) {
   if (navigator.share) { try { await navigator.share({ text }); } catch { /* abgebrochen */ } }
   else copyText(text);
 }
-$('copy').onclick = async () => { if (await copyText(shownText)) flash($('copy'), 'Kopiert'); };
-$('share').onclick = () => shareText(shownText);
 function flash(btn, label) {
   const old = btn.textContent;
   btn.textContent = label;
   setTimeout(() => (btn.textContent = old), 1400);
 }
+$('copy').onclick = async () => { if (await copyText(shownText)) flash($('copy'), 'Kopiert'); };
+$('share').onclick = () => shareText(shownText);
 
 // ---------- Knopf ----------
 const btn = $('rec');
@@ -333,11 +264,13 @@ btn.addEventListener('click', async () => {
 });
 
 // ---------- Pegel und Ringe ----------
+// Pegel aus dem Mikrofon, wenn iOS es parallel zur Erkennung hergibt, sonst aus den Erkennungs-Ereignissen.
 const meter = (() => {
   const canvas = $('rings');
   const g = canvas.getContext('2d');
-  let ctx, analyser, source, data, raf = 0;
-  let level = 0, vel = 0, fade = 0;
+  let ctx, analyser, stream, data, raf = 0;
+  let level = 0, vel = 0, fade = 0, pulse = 0;
+  const noMic = () => localStorage.getItem('noMeterMic') === '1';
   const size = () => {
     const dpr = devicePixelRatio || 1;
     canvas.width = canvas.clientWidth * dpr;
@@ -348,7 +281,8 @@ const meter = (() => {
   addEventListener('resize', size);
 
   function frame(t) {
-    let target = 0;
+    let target = pulse;
+    pulse *= 0.94;
     if (analyser) {
       analyser.getByteTimeDomainData(data);
       let sum = 0;
@@ -356,29 +290,29 @@ const meter = (() => {
       target = Math.min(1, Math.sqrt(sum / data.length) * 4.5);
     }
     // Feder statt linearem Glätten
-    vel += ((target - level) * 0.22 - vel * 0.5);
+    vel += (target - level) * 0.22 - vel * 0.5;
     level = Math.max(0, level + vel);
     fade += ((rec ? 1 : 0) - fade) * 0.08;
 
     const w = canvas.clientWidth, h = canvas.clientHeight, cx = w / 2, cy = h / 2;
     g.clearRect(0, 0, w, h);
-    const red = getComputedStyle(document.documentElement).getPropertyValue('--red').trim();
-    g.strokeStyle = g.fillStyle = red;
-
+    g.strokeStyle = g.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--red').trim();
+    const base = 88;
     if (reduceMotion.matches) {
       g.globalAlpha = fade * (0.15 + level * 0.5);
       g.lineWidth = 3;
       g.beginPath(); g.arc(cx, cy, 96, 0, Math.PI * 2); g.stroke();
     } else {
       // Wellenform rund um den Knopf
-      const n = 96, base = 88;
+      const n = 96;
       g.globalAlpha = fade * 0.16;
       g.beginPath();
       for (let i = 0; i <= n; i++) {
         const a = (i / n) * Math.PI * 2;
-        const s = analyser ? (data[(i * 7) % data.length] - 128) / 128 : 0;
-        const r = base + 4 + Math.abs(s) * 46 * (0.35 + level) + Math.sin(a * 3 + t / 600) * 2 * level;
-        i ? g.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r) : g.moveTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+        const s = analyser ? Math.abs(data[(i * 7) % data.length] - 128) / 128 : (Math.sin(a * 5 + t / 260) + 1) * 0.25;
+        const r = base + 4 + s * 46 * (0.35 + level) + Math.sin(a * 3 + t / 600) * 2 * level;
+        const x = cx + Math.cos(a) * r, y = cy + Math.sin(a) * r;
+        i ? g.lineTo(x, y) : g.moveTo(x, y);
       }
       g.closePath(); g.fill();
       // Ringe, die mit der Lautstärke weiter hinausgehen
@@ -393,28 +327,33 @@ const meter = (() => {
     raf = fade > 0.01 || rec ? requestAnimationFrame(frame) : 0;
     if (!raf) g.clearRect(0, 0, w, h);
   }
+  const run = () => { if (!raf) raf = requestAnimationFrame(frame); };
 
   return {
-    connect(stream) {
-      ctx ??= new (window.AudioContext || window.webkitAudioContext)();
-      ctx.resume();
-      source?.disconnect();
-      source = ctx.createMediaStreamSource(stream);
-      analyser = ctx.createAnalyser();
-      analyser.fftSize = 1024;
-      data = new Uint8Array(analyser.fftSize);
-      source.connect(analyser);
-      if (!raf) raf = requestAnimationFrame(frame);
+    get live() { return Boolean(stream); },
+    async start() {
+      run();
+      if (stream || noMic()) return;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        ctx ??= new (window.AudioContext || window.webkitAudioContext)();
+        await ctx.resume();
+        analyser = ctx.createAnalyser();
+        analyser.fftSize = 1024;
+        data = new Uint8Array(analyser.fftSize);
+        ctx.createMediaStreamSource(stream).connect(analyser);
+      } catch { this.stop(); }
     },
-    disconnect() { source?.disconnect(); source = null; analyser = null; },
+    bump() { pulse = Math.min(1, pulse + 0.5); run(); },
+    giveUpMic() { localStorage.setItem('noMeterMic', '1'); this.stop(); },
+    stop() { stream?.getTracks().forEach((t) => t.stop()); stream = null; analyser = null; },
   };
 })();
 
 // ---------- Verlauf ----------
 async function renderHistory() {
-  const list = $('history');
-  const sessions = (await all('sessions')).filter((s) => s.state !== 'recording').sort((a, b) => b.createdAt - a.createdAt);
-  list.replaceChildren(...sessions.map(historyItem));
+  const sessions = (await all()).filter((s) => s.state === 'final').sort((a, b) => b.createdAt - a.createdAt);
+  $('history').replaceChildren(...sessions.map(historyItem));
 }
 
 function historyItem(s) {
@@ -430,7 +369,7 @@ function historyItem(s) {
   const [d, len] = li.querySelectorAll('.item-meta span');
   d.textContent = dateCH(s.createdAt);
   len.textContent = clock(s.duration);
-  li.querySelector('.item-text').textContent = s.state === 'final' ? s.text || 'Kein Text erkannt.' : 'Wird übertragen …';
+  li.querySelector('.item-text').textContent = s.text || 'Kein Text erkannt.';
   const body = li.querySelector('.item-body');
 
   li.querySelector('[data-a=copy]').onclick = async (e) => { if (await copyText(s.text)) flash(e.target, 'Kopiert'); };
@@ -439,7 +378,7 @@ function historyItem(s) {
     haptic();
     li.style.transition = 'opacity .25s';
     li.style.opacity = '0';
-    await Promise.all([del('sessions', s.id), ...(await segmentsOf(s.id)).map((g) => del('segments', g.key))]);
+    await del(s.id);
     if (s.synced) fetch(`/api/transcripts?id=${encodeURIComponent(s.id)}`, { method: 'DELETE', headers: { authorization: `Bearer ${token()}` } }).catch(() => {});
     setTimeout(() => li.remove(), 250);
   };
@@ -508,37 +447,17 @@ for (const handle of [$('grabber'), sheet.querySelector('.sheet-head')]) {
   });
 }
 
-// ---------- Zugang ----------
-function openSettings() {
-  $('token').value = token();
-  $('settings').showModal();
-}
-$('openSettings').onclick = openSettings;
+// ---------- Zugang (nur für die Ablage, die Claude liest) ----------
+$('openSettings').onclick = () => { $('token').value = token(); $('settings').showModal(); };
 $('settings').addEventListener('close', () => {
-  if ($('settings').returnValue === 'save') {
-    localStorage.setItem('token', $('token').value.trim());
-    setStatus('');
-    pump();
-  }
+  if ($('settings').returnValue !== 'save') return;
+  localStorage.setItem('token', $('token').value.trim());
+  setStatus('');
+  sync();
 });
 
 // ---------- Start ----------
-// Abgebrochene Aufnahmen (App weggewischt, iOS beendet) nachholen.
-for (const s of await all('sessions')) {
-  if (s.state === 'recording') {
-    const segs = await segmentsOf(s.id);
-    s.duration = segs.reduce((sum, g) => sum + g.duration, 0);
-    s.state = 'ended';
-    await put('sessions', s);
-  }
-}
-for (const g of await all('segments')) {
-  if (g.status === 'recording') {
-    g.status = g.blob?.size && g.duration >= MIN_SEG_S ? 'pending' : 'done';
-    if (g.status === 'done') g.text = '';
-    await put('segments', g);
-  }
-}
-if (!MIME && !window.MediaRecorder) setStatus('Dieser Browser kann nicht aufnehmen.');
-pump();
+// Diktat, das beim Wegwischen noch lief: Zwischenstand ist gesichert, also abschliessen.
+for (const s of await all()) if (s.state === 'recording') { s.state = 'final'; await put(s); }
+sync();
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');

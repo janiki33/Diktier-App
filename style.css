@@ -122,8 +122,15 @@ button { font: inherit; color: inherit; border: 0; background: none; padding: 0;
   from { opacity: 0; filter: blur(6px); transform: translateY(4px); }
   to { opacity: 1; filter: none; transform: none; }
 }
-.gap { display: block; color: var(--label-3); font-size: 14px; margin: 6px 0; }
-.pending { color: var(--label-3); }
+.text { margin: 0; }
+.interim { color: var(--label-3); }
+.interim:not(:empty)::before { content: ' '; }
+#kbd {
+  display: none; width: 100%; min-height: 40vh; border: 0; resize: none; outline: none;
+  background: transparent; color: var(--label); font: inherit; padding: 0;
+}
+.keyboard #kbd { display: block; }
+.keyboard .text, .keyboard .placeholder { display: none; }
 
 .actions {
   display: flex; gap: 12px; justify-content: center;

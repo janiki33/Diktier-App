@@ -3,21 +3,10 @@ import assert from 'node:assert/strict';
 
 process.env.APP_TOKEN = 'app-secret';
 process.env.MCP_TOKEN = 'mcp-secret';
-process.env.OPENAI_API_KEY = 'sk-test';
-process.env.ELEVENLABS_API_KEY = 'el-test';
 
-const { swiss, authorized } = await import('../api/_lib.js');
-const transcribe = await import('../api/transcribe.js');
+const { authorized } = await import('../api/_lib.js');
+const transcripts = await import('../api/transcripts.js');
 const mcp = await import('../api/mcp.js');
-
-const audio = (q = '', tok = 'app-secret') =>
-  new Request(`https://x.test/api/transcribe${q}`, {
-    method: 'POST', headers: { authorization: `Bearer ${tok}`, 'content-type': 'audio/mp4' }, body: new Uint8Array([1, 2, 3]),
-  });
-
-test('ss statt ß', () => {
-  assert.equal(swiss(' Grüße, Straße '), 'Grüsse, Strasse');
-});
 
 test('Token: Header oder Query, getrennt für App und MCP', () => {
   assert.ok(authorized(new Request('https://x.test/', { headers: { authorization: 'Bearer app-secret' } })));
@@ -26,34 +15,12 @@ test('Token: Header oder Query, getrennt für App und MCP', () => {
   assert.ok(!authorized(new Request('https://x.test/')));
 });
 
-test('Transkription: falscher Token wird abgewiesen', async () => {
-  assert.equal((await transcribe.POST(audio('', 'falsch'))).status, 401);
-});
-
-test('Transkription: Anbieter wählbar, Ausgabe ohne ß', async () => {
-  const calls = [];
-  globalThis.fetch = async (url, init) => {
-    calls.push({ url: String(url), init });
-    return new Response(JSON.stringify({ text: 'Schöne Grüße aus Luzern' }), { status: 200 });
-  };
-  const r1 = await (await transcribe.POST(audio())).json();
-  assert.equal(r1.provider, 'openai');
-  assert.equal(r1.text, 'Schöne Grüsse aus Luzern');
-  assert.match(calls[0].url, /openai\.com/);
-  assert.equal(calls[0].init.body.get('language'), 'de');
-
-  const r2 = await (await transcribe.POST(audio('?provider=elevenlabs'))).json();
-  assert.equal(r2.provider, 'elevenlabs');
-  assert.match(calls[1].url, /elevenlabs\.io/);
-  assert.equal(calls[1].init.headers['xi-api-key'], 'el-test');
-
-  assert.equal((await transcribe.POST(audio('?provider=gibtsnicht'))).status, 400);
-});
-
-test('Transkription: Anbieterfehler kommt als 502 zurück', async () => {
-  globalThis.fetch = async () => new Response('kaputt', { status: 500 });
-  const r = await transcribe.POST(audio());
-  assert.equal(r.status, 502);
+test('Ablage: falscher Token und ungültige Felder werden abgewiesen', async () => {
+  const req = (body, tok = 'app-secret') =>
+    new Request('https://x.test/api/transcripts', { method: 'POST', headers: { authorization: `Bearer ${tok}` }, body: JSON.stringify(body) });
+  assert.equal((await transcripts.POST(req({}, 'falsch'))).status, 401);
+  assert.equal((await transcripts.POST(req({ id: '../x', createdAt: 1, duration: 1, text: 'a' }))).status, 400);
+  assert.equal((await transcripts.POST(req({ id: 'abcdef12', createdAt: 1, duration: 1 }))).status, 400);
 });
 
 const rpc = (body, tok = 'mcp-secret') =>
