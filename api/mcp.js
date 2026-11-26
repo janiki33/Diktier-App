@@ -17,7 +17,9 @@ const TOOLS = [
   },
   {
     name: 'get_transcript',
-    description: 'Gibt den vollständigen Text eines Diktats zurück. id aus list_transcripts.',
+    description:
+      'Gibt den vollständigen Text eines Diktats zurück. id aus list_transcripts. ' +
+      'Sprecher sind nicht markiert: Sprechen mehrere Personen, aus Inhalt und Anrede ableiten, wer was sagt, und Unsicheres als Vermutung kennzeichnen.',
     inputSchema: {
       type: 'object',
       properties: { id: { type: 'string' } },
