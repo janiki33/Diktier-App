@@ -1,0 +1,13 @@
+{
+  "name": "diktier-app",
+  "version": "1.0.0",
+  "description": "Diktier-PWA mit Schweizerdeutsch-Transkription",
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.9.0"
+  },
+  "private": true,
+  "type": "module"
+}

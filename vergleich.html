@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="de-CH">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Anbieter-Vergleich</title>
+<meta name="color-scheme" content="light dark">
+<style>
+  :root { --bg:#f7f7f9; --card:#fff; --label:#1c1c1e; --label-2:rgba(60,60,67,.62); --red:#ff3b30; --fill:rgba(120,120,128,.12); }
+  @media (prefers-color-scheme: dark) { :root { --bg:#000; --card:#1c1c1e; --label:#f5f5f7; --label-2:rgba(235,235,245,.6); --red:#ff453a; --fill:rgba(120,120,128,.24); } }
+  body { margin:0; background:var(--bg); color:var(--label); font:17px/1.47 -apple-system, system-ui, sans-serif;
+    padding:calc(env(safe-area-inset-top) + 20px) 20px calc(env(safe-area-inset-bottom) + 20px); }
+  h1 { font-size:28px; margin:0 0 6px; }
+  p { color:var(--label-2); margin:0 0 20px; font-size:15px; }
+  button { font:inherit; font-weight:600; border:0; border-radius:25px; height:50px; padding:0 24px; background:var(--red); color:#fff; }
+  button:disabled { opacity:.4; }
+  .card { background:var(--card); border-radius:14px; padding:14px 16px; margin-top:14px; }
+  .card h2 { font-size:15px; margin:0 0 6px; color:var(--label-2); font-weight:600; display:flex; justify-content:space-between; }
+  .card div { white-space:pre-wrap; }
+  #status { margin-top:12px; color:var(--label-2); font-size:15px; }
+</style>
+</head>
+<body>
+<h1>Anbieter-Vergleich</h1>
+<p>Etwa 20 Sekunden Schweizerdeutsch sprechen, mit Namen, Zahlen und Fachwörtern. Dieselbe Aufnahme geht an beide Anbieter. Der Zugangscode kommt aus der Diktat-App.</p>
+<button id="rec">Aufnahme starten</button>
+<div id="status"></div>
+<div id="out"></div>
+<script type="module">
+const token = localStorage.getItem('token') || '';
+const btn = document.getElementById('rec'), out = document.getElementById('out'), status = document.getElementById('status');
+const MIME = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'].find((t) => MediaRecorder.isTypeSupported(t)) || '';
+let mr = null, chunks = [], t0 = 0;
+if (!token) status.textContent = 'Zuerst in der Diktat-App unter Verlauf > Zugang den Code eingeben.';
+
+btn.onclick = async () => {
+  if (mr) { mr.stop(); return; }
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  chunks = [];
+  mr = new MediaRecorder(stream, MIME ? { mimeType: MIME } : undefined);
+  mr.ondataavailable = (e) => chunks.push(e.data);
+  mr.onstop = () => { stream.getTracks().forEach((t) => t.stop()); compare(new Blob(chunks, { type: mr.mimeType || MIME })); mr = null; btn.textContent = 'Nochmals aufnehmen'; };
+  mr.start();
+  t0 = Date.now();
+  btn.textContent = 'Stoppen';
+  out.replaceChildren();
+};
+
+async function compare(blob) {
+  status.textContent = `${((Date.now() - t0) / 1000).toFixed(0)} s aufgenommen, wird übertragen …`;
+  btn.disabled = true;
+  await Promise.all(['openai', 'elevenlabs'].map(async (p) => {
+    const card = document.createElement('section');
+    card.className = 'card';
+    card.innerHTML = `<h2><span>${p === 'openai' ? 'OpenAI' : 'ElevenLabs Scribe'}</span><span>…</span></h2><div></div>`;
+    out.append(card);
+    const s = performance.now();
+    const r = await fetch(`/api/transcribe?provider=${p}`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': blob.type }, body: blob });
+    const data = await r.json().catch(() => ({}));
+    card.querySelector('h2 span:last-child').textContent = `${((performance.now() - s) / 1000).toFixed(1)} s`;
+    card.querySelector('div').textContent = r.ok ? data.text || '(leer)' : `Fehler: ${data.error || r.status}`;
+  }));
+  status.textContent = 'Fertig. Der bessere Anbieter wird bei Vercel als STT_PROVIDER eingetragen.';
+  btn.disabled = false;
+}
+</script>
+</body>
+</html>
